@@ -1,0 +1,12 @@
+source [file join [file dirname [info script]] common.tcl]
+
+test lambdaric-1.1 {} -body { #<<<
+} -result xx
+#>>>
+
+
+# cleanup
+::tcltest::cleanupTests
+return
+
+# vim: ft=tcl foldmethod=marker foldmarker=<<<,>>> ts=4 shiftwidth=4

@@ -1,0 +1,241 @@
+if {"bench" ni [info commands bench]} {
+	package require bench
+	namespace import bench::*
+}
+
+set here	[file dirname [file normalize [info script]]]
+set ver		[package require lambdaric]
+set thread_setup [string map [list \
+	%auto_path%			[list $::auto_path] \
+	%tm_path%			[lreverse [tcl::tm::path list]] \
+	%load_dev_package%	[list package ifneeded lambdaric $ver [package ifneeded $lambdaric $ver]] \
+	%here%				[list $here] \
+] {
+	set here			%here% \
+	set auto_path		%auto_path%
+	tcl::tm::path remove {*}[tcl::tm::path list]
+	tcl::tm::path add %tm_path%
+	%load_dev_package%
+}]
+
+source [file join $here ../tests/events.tcl]
+
+# Fake runtime API <<<
+oo::class create fake_api { #<<<
+	variable {*}{
+		sock
+		invocation
+		yieldto
+		tid
+		ric_setup
+		client_connect
+		evname
+	}
+
+	constructor {} { #<<<
+		if {[self next]} next
+
+		set ev			[encoding convertto utf-8 [dict get $::events $evname]]
+		set invocation	"HTTP/1.1 200 OK\r\nLambda-Runtime-Aws-Request-Id: req foo!\r\nContent-Length: [string length $ev]\r\n\r\n$ev"
+
+		set tid		[thread::create -preserved]
+		thread::send $tid $::thread_setup
+		thread::send $tid {
+			set ::restore_env	[if {[info exists env(AWS_LAMBDA_RUNTIME_API)]} {
+				set restore_env	[list set ::env(AWS_LAMBDA_RUNTIME_API) $env(AWS_LAMBDA_RUNTIME_API)]
+			}]
+		}
+		thread::send $tid [list set ::env(AWS_LAMBDA_RUNTIME_API) $client_connect]
+		thread::send -async $tid $ric_setup
+
+		# Wait for connection
+		set yieldto	[list [info coroutine]]
+		lassign [yieldto return -level 0] o r
+		return -options $o $r
+	}
+
+	#>>>
+	destructor { #<<<
+		if {[llength [info commands runtime_coro]]} {
+			runtime_coro shutdown
+		}
+		if {[info exists tid]} {
+			thread::release $tid
+		}
+		if {[info exists sock] && $sock in [chan names]} {
+			close $sock
+		}
+		unset -nocomplain sock tid
+		if {[self next]} next
+	}
+
+	#>>>
+	method accept {chan args} { #<<<
+		try {
+			if {[llength [info commands runtime_coro]]} {
+				error "Runtime already started"
+			}
+			coroutine runtime_coro my chan_handler $chan
+		} on error {errmsg options} {
+			close $chan
+		}
+	}
+
+	#>>>
+	method chan_handler chan { #<<<
+		trace add command [info coroutine] delete [list apply {chan {
+			# Coro destructor
+			if {$chan in [chan names]} {close $chan}
+		}} $chan]
+
+		chan configure $chan -translation binary -buffering none -blocking 0
+
+		chan configure $chan -blocking 1
+		set reqline	[gets $chan]
+		chan configure $chan -blocking 0
+		set chunk	[read $chan]
+		if {![string match GET* $reqline]} {
+			error "Unmatched reqline: ($reqline)"
+		}
+
+		while 1 {
+			lassign [yieldto {*}$yieldto $o $r] cmd args
+			set yieldto {return -level 0 -options}
+			try {
+				switch -exact -- $cmd {
+					invoke {
+						puts -nonewline $chan $invocation
+						puts "Wrote invocation"
+						while 1 {
+							# TODO: implement a jitc http message parser
+							chan configure $chan -blocking 1
+							set reqline	[gets $chan]
+							chan configure $chan -blocking 0
+							set chunk	[read $chan]
+							puts "reqline: ($reqline)\nchunk: ($chunk)"
+							if {[eof $chan]} break
+							switch -glob -- $reqline {
+								POST* {
+									puts -nonewline $chan "HTTP/1.1 200 Ok\r\nContent-Length: 0\r\n\r\n"
+									puts "Got post: $reqline\n$chunk"
+								}
+
+								GET* break
+
+								default { error "Unmatched reqline: ($reqline)" }
+							}
+						}
+					}
+
+					shutdown { my destroy; break }
+					default  { error "Unknown command: $cmd" }
+				}
+			} on ok {r o} {
+			} on error {r o} {}
+		}
+	}
+
+	#>>>
+
+	method coro {} {namepace which -command runtime_coro}
+}
+
+#>>>
+oo::class create fake_api_lo { #<<<
+	superclass fake_api
+
+	variable sock ric_setup client_connect evname
+
+	constructor {a_evname a_ric_setup} {
+		set evname			$a_evname
+		set ric_setup		$a_ric_setup
+		set sock			[socket -server [namespace code {my accept}] 0]
+		set port			[lindex [chan configure $sock -sockname] 0 2]
+		set client_connect	localhost:$port
+		if {[self next]} next
+	}
+}
+
+#>>>
+oo::class create fake_api_uds { #<<<
+	superclass fake_api
+
+	variable sock ric_setup client_connect evname tempdir
+
+	constructor {a_evname a_ric_setup} {
+		package require unix_sockets
+		set evname			$a_evname
+		set ric_setup		$a_ric_setup
+		set tempdir			[file tempdir]
+		set path			[file join $tempdir fake_lambda_runtime.[pid]]
+		set sock			[unix_sockets::listen $path [namespace code {my accept}]]
+		set client_connect	\[$path\]
+		if {[self next]} next
+	}
+
+	destructor {
+		if {[info exists tempdir]} {file delete -force -- $tempdir}
+		if {[self next]} next
+	}
+}
+
+#>>>
+# Fake runtime API >>>
+
+bench lambdaric-1.1 {basic request latency} -batch auto -setup { #<<<
+	set handler {
+		package require lambdaric
+		namespace import lambdaric::ns_compat::*
+
+		lambdaric setup {
+			try $::restore_env
+		} {{event context} {
+			lambdaric::alb set [encoding convertto utf-8 $event]
+			ns_set update [ns_conn outputheaders] X-RL-Test "foo"
+			ns_set update [ns_conn outputheaders] Cache-Control max-age=31536000
+			ns_set put    [ns_conn outputheaders] Access-Control-Allow-Origin *
+			ns_respond -type text/html -binary [encoding convertto utf-8 "hello from lambda"]
+		}}
+	}
+
+	set old_handler {
+		proc handler {event context} {
+			json template {
+				{
+					"isBase64Encoded":	false,
+					"statusCode":		200,
+					"multiValueHeaders": {
+						"Content-Type":					[ "text/html; charset=utf-8" ],
+						"X-RL-Test":					[ "foo" ],
+						"Cache-Control":				[ "max-age=31536000" ],
+						"Access-Control-Allow-Origin":	[ "*" ]
+					},
+					"body":	"hello from lambda"
+				}
+			}
+		}
+
+		set argv	ignored.handler
+		source [file join $here awslambdaric-test.tcl]
+	}
+
+	set ev	apig_v1_mvheaders
+} -deps {
+	awslambdaric { set old [[fake_api_lo  create rt_old $ev $old_handler] coro] }
+	localhost    { set lo  [[fake_api_lo  create rt_lo  $ev $handler    ] coro] }
+	uds          { set uds [[fake_api_uds create rt_uds $ev $handler    ] coro] }
+} -compare {
+	awslambdaric { $old invoke }
+	localhost    { $lo  invoke }
+	uds          { $uds invoke }
+} -cleanup {
+	foreach type {old lo uds} {
+		if {[info exists $type]}               { [set $type] shutdown }
+		if {[info object isa object rt_$type]} { rt_$type destroy }
+		unset -nocomplain $type
+	}
+	unset -nocomplain type handler old_handler ev
+} -result xx
+#>>>
+
+# vim: ft=tcl foldmethod=marker foldmarker=<<<,>>> ts=4 shiftwidth=4

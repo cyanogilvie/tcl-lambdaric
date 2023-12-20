@@ -1,0 +1,11 @@
+[submodule "tclconfig"]
+	path = tclconfig
+	url = https://github.com/cyanogilvie/tclconfig
+	shallow = true
+[submodule "teabase"]
+	path = teabase
+	url = https://github.com/cyanogilvie/teabase
+[submodule "deps/re2c"]
+	path = deps/re2c
+	url = https://github.com/skvadrik/re2c
+	shallow = true
